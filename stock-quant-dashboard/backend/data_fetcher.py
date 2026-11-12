@@ -330,12 +330,87 @@ def get_foreign_flow(symbol: str, days: int = 20) -> pd.DataFrame:
 
 def get_proprietary_flow(symbol: str, days: int = 20) -> pd.DataFrame:
     """
-    Proprietary (tự doanh) net buy/sell per session in Billion VND.
-    No reliable public API available without authentication.
-    Returns 0.0 for all sessions — honest fallback, never fake random data.
+    Fetch real daily proprietary (Tự doanh) net trading value in Billion VND from CafeF API.
+    Primary URL: https://s.cafef.vn/Ajax/PageNew/DataHistory/GDTuDoanh.ashx?Symbol={symbol}&StartDate=&EndDate=&PageIndex=1&PageSize={page_size}
+    Fallback URL: https://cafef.vn/du-lieu/Ajax/PageNew/DataHistory/GDTuDoanh.ashx?Symbol={symbol}&StartDate=&EndDate=&PageIndex=1&PageSize={page_size}
+
+    Parses "Data" -> "Data" list/dict, computes net_value = (GtMua - GtBan) / 1e9,
+    and aligns dates with get_price_history().
     """
     symbol = symbol.upper()
-    logger.info("[ProprietaryFlow] No public API available for %s — returning 0.0", symbol)
+    page_size = max(days + 15, 30)
+
+    # 1. Fetch from CafeF API
+    urls = [
+        f"https://s.cafef.vn/Ajax/PageNew/DataHistory/GDTuDoanh.ashx?Symbol={symbol}&StartDate=&EndDate=&PageIndex=1&PageSize={page_size}",
+        f"https://cafef.vn/du-lieu/Ajax/PageNew/DataHistory/GDTuDoanh.ashx?Symbol={symbol}&StartDate=&EndDate=&PageIndex=1&PageSize={page_size}",
+    ]
+
+    cafef_headers = dict(HEADERS)
+    cafef_headers.update({
+        "Referer": "https://cafef.vn/",
+        "Accept": "application/json, text/plain, */*",
+    })
+
+    items = []
+    for url in urls:
+        logger.info("[ProprietaryFlow] Fetching from CafeF: %s", url)
+        try:
+            resp = requests.get(url, headers=cafef_headers, timeout=TIMEOUT)
+            if resp.status_code == 200:
+                res_json = resp.json()
+                data_obj = res_json.get("Data")
+                if data_obj:
+                    # "Data" -> "Data" (can be list or dict containing ListDataTudoanh)
+                    inner_data = data_obj.get("Data") if isinstance(data_obj, dict) else data_obj
+                    if isinstance(inner_data, dict):
+                        items = inner_data.get("ListDataTudoanh", [])
+                    elif isinstance(inner_data, list):
+                        items = inner_data
+                    if items:
+                        logger.info("[ProprietaryFlow] Successfully fetched %d items from %s", len(items), url)
+                        break
+        except Exception as exc:
+            logger.warning("[ProprietaryFlow] Failed to fetch from %s: %s", url, exc)
+
+    # 2. Parse items into mapping: date (YYYY-MM-DD) -> net_value (Billion VND)
+    cafef_dict = {}
+    for item in items:
+        raw_date = str(item.get("Date", "")).strip()
+        parts = raw_date.split("/")
+        if len(parts) == 3:
+            iso_date = f"{parts[2].zfill(4)}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+        else:
+            iso_date = raw_date
+
+        try:
+            gt_mua = float(item.get("GtMua", 0) or 0)
+            gt_ban = float(item.get("GtBan", 0) or 0)
+            net_val = round((gt_mua - gt_ban) / 1e9, 2)
+            cafef_dict[iso_date] = net_val
+        except (TypeError, ValueError):
+            continue
+
+    # 3. Align dates with get_price_history()
+    price_df = get_price_history(symbol, days=days)
+    if not price_df.empty and "Date" in price_df.columns:
+        aligned_rows = []
+        for d in price_df["Date"].tolist():
+            aligned_rows.append({
+                "Date": d,
+                "NetValue_Billion": cafef_dict.get(d, 0.0),
+            })
+        df_prop = pd.DataFrame(aligned_rows)
+        logger.info("[ProprietaryFlow] Aligned %d sessions with price history for %s", len(df_prop), symbol)
+        return df_prop
+
+    # Fallback if price history unavailable: use CafeF dates directly
+    if cafef_dict:
+        rows = [{"Date": d, "NetValue_Billion": v} for d, v in cafef_dict.items()]
+        df_prop = pd.DataFrame(rows).sort_values("Date").tail(days).reset_index(drop=True)
+        return df_prop
+
+    logger.warning("[ProprietaryFlow] No data found for %s — returning zero-filled DataFrame", symbol)
     biz_dates = pd.bdate_range(end=date.today(), periods=days)
     return pd.DataFrame({
         "Date": [str(d.date()) for d in biz_dates],
@@ -393,5 +468,5 @@ if __name__ == "__main__":
     # Proprietary
     print()
     pf_df = get_proprietary_flow(ticker, days=20)
-    print(f"✅ PROPRIETARY FLOW: {len(pf_df)} rows (honest 0.0 fallback)")
-    print(pf_df.tail(3).to_string(index=False))
+    print(f"✅ PROPRIETARY FLOW: {len(pf_df)} rows (CafeF real data)")
+    print(pf_df.tail(5).to_string(index=False))
