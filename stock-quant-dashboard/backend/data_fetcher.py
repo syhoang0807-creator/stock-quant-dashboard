@@ -10,6 +10,7 @@ Sources:
 
 import logging
 import math
+import time as _time
 from datetime import date, timedelta, datetime
 
 import pandas as pd
@@ -59,17 +60,21 @@ def _fetch_price_dnse(symbol: str, days: int) -> pd.DataFrame:
     DNSE Entrade Chart API.
     Returns arrays t, o, h, l, c, v.
     Prices already in thousand VND (e.g. 31.55).
+
+    unix_end is set 2 days into the future (+172800 s) so UTC vs UTC+7 timezone
+    differences never accidentally exclude today's EOD candle.
     """
-    end_dt = date.today()
-    # Request a wider window to account for weekends/holidays
-    start_dt = end_dt - timedelta(days=max(days * 2, 90))
+    start_dt = date.today() - timedelta(days=max(days * 2, 90))
+    unix_start = _to_unix(start_dt)
+    # +172800 s = +2 days buffer → ensures today's candle is always included
+    unix_end = int(_time.time()) + 172800
 
     url = (
         "https://services.entrade.com.vn/chart-api/v2/ohlcs/stock"
-        f"?from={_to_unix(start_dt)}&to={_to_unix(end_dt)}"
+        f"?from={unix_start}&to={unix_end}"
         f"&symbol={symbol}&resolution=1D"
     )
-    logger.info("[DNSE] Fetching price: %s", url)
+    logger.info("[DNSE] Fetching price (unix_end+2d buffer): %s", url)
 
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
@@ -95,7 +100,8 @@ def _fetch_price_dnse(symbol: str, days: int) -> pd.DataFrame:
     rows = []
     for i, ts in enumerate(t_arr):
         try:
-            dt = datetime.utcfromtimestamp(ts).date()
+            # Use UTC+7 (Vietnam timezone) for date conversion to avoid off-by-one
+            dt = datetime.fromtimestamp(ts).date()
             rows.append({
                 "Date":   str(dt),
                 "Open":   _safe_float(o_arr[i] if i < len(o_arr) else None),
@@ -112,25 +118,35 @@ def _fetch_price_dnse(symbol: str, days: int) -> pd.DataFrame:
         return df
 
     df = df.sort_values("Date").tail(days).reset_index(drop=True)
-    logger.info("[DNSE] Got %d rows for %s (last close=%.2f)", len(df), symbol, df["Close"].iloc[-1])
+    logger.info("[DNSE] Got %d rows for %s (last date=%s, last close=%.2f)",
+                len(df), symbol, df["Date"].iloc[-1], df["Close"].iloc[-1])
     return df
 
 
 # ── Price: VNDirect Finfo (backup) ────────────────────────────────────────────
 
-def _fetch_price_vndirect(symbol: str, days: int) -> pd.DataFrame:
+def _fetch_price_vndirect(symbol: str, days: int, latest_only: bool = False) -> pd.DataFrame:
     """
-    VNDirect Finfo v4 — backup price source.
+    VNDirect Finfo v4 — backup/merge price source.
     Prices: if raw value > 500 → divide by 1000, else keep as-is (already in thousand VND).
-    """
-    start_dt = date.today() - timedelta(days=max(days * 2, 90))
-    start_str = start_dt.strftime("%Y-%m-%d")
-    size = max(days + 10, 60)
 
-    url = (
-        "https://api-finfo.vndirect.com.vn/v4/stock_prices"
-        f"?sort=date&q=code:{symbol}~date:gte:{start_str}&size={size}"
-    )
+    latest_only=True  → fetch the most recent 45 candles without date filter
+                        (used to fill a 1-day lag from DNSE).
+    latest_only=False → fetch with date filter for a full history window.
+    """
+    if latest_only:
+        url = (
+            "https://api-finfo.vndirect.com.vn/v4/stock_prices"
+            f"?sort=date&q=code:{symbol}&size=45"
+        )
+    else:
+        start_dt = date.today() - timedelta(days=max(days * 2, 90))
+        start_str = start_dt.strftime("%Y-%m-%d")
+        size = max(days + 10, 60)
+        url = (
+            "https://api-finfo.vndirect.com.vn/v4/stock_prices"
+            f"?sort=date&q=code:{symbol}~date:gte:{start_str}&size={size}"
+        )
     logger.info("[VNDirect] Fetching price: %s", url)
 
     try:
@@ -167,8 +183,35 @@ def _fetch_price_vndirect(symbol: str, days: int) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.sort_values("Date").tail(days).reset_index(drop=True)
-    logger.info("[VNDirect] Got %d rows for %s (last close=%.2f)", len(df), symbol, df["Close"].iloc[-1])
+    logger.info("[VNDirect] Got %d rows for %s (last date=%s, last close=%.2f)",
+                len(df), symbol, df["Date"].iloc[-1], df["Close"].iloc[-1])
     return df
+
+
+# ── Helper: get latest foreign flow date (for lag detection) ──────────────────
+
+def _get_latest_foreign_date(symbol: str) -> str | None:
+    """
+    Quick-fetch the most recent trading date from VNDirect foreign flow.
+    Returns date string "YYYY-MM-DD" or None on failure.
+    Used to detect if DNSE price data is lagging by 1 day.
+    """
+    url = (
+        "https://api-finfo.vndirect.com.vn/v4/foreigns"
+        f"?sort=tradingDate&q=code:{symbol}&size=5"
+    )
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        items = resp.json().get("data", [])
+        if items:
+            latest = max(str(it.get("tradingDate", ""))[:10] for it in items)
+            logger.info("[LagCheck] Latest foreign flow date for %s: %s", symbol, latest)
+            return latest
+    except Exception as exc:
+        logger.warning("[LagCheck] Could not fetch foreign date for %s: %s", symbol, exc)
+    return None
 
 
 # ── Public: get_price_history ─────────────────────────────────────────────────
@@ -177,24 +220,60 @@ def get_price_history(symbol: str, days: int = 30) -> pd.DataFrame:
     """
     Fetch EOD candlestick data (Open, High, Low, Close, Volume).
     Prices in thousand VND (e.g. 31.55 = 31,550 VND).
+
+    Strategy:
+    1. Try DNSE Entrade (unix_end +2 days buffer to fix UTC vs UTC+7 lag).
+    2. Fetch foreign flow latest date as the "expected latest trading day".
+    3. If DNSE's latest candle date is 1 day behind the foreign flow date,
+       fetch VNDirect (latest_only=True, size=45) and merge to fill the gap.
+    4. If DNSE fails entirely, fall back to VNDirect full history.
     Returns empty DataFrame if all sources fail — NEVER fake data.
     """
     symbol = symbol.upper()
+    today_str = str(date.today())
 
-    # Primary: DNSE Entrade
-    df = _fetch_price_dnse(symbol, days)
-    if not df.empty and len(df) >= 5:
-        return df
+    # Primary: DNSE Entrade (with +2d future buffer)
+    df_dnse = _fetch_price_dnse(symbol, days)
 
-    logger.warning("[PriceHistory] DNSE failed or insufficient for %s, trying VNDirect...", symbol)
+    if df_dnse.empty or len(df_dnse) < 5:
+        logger.warning("[PriceHistory] DNSE failed or insufficient for %s, trying VNDirect full...", symbol)
+        df_vnd = _fetch_price_vndirect(symbol, days, latest_only=False)
+        if not df_vnd.empty:
+            return df_vnd
+        logger.error("[PriceHistory] ALL sources failed for %s. Returning empty DataFrame.", symbol)
+        return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
 
-    # Backup: VNDirect Finfo
-    df = _fetch_price_vndirect(symbol, days)
-    if not df.empty:
-        return df
+    # Check if DNSE is lagging behind by comparing with foreign flow's latest date
+    dnse_latest = df_dnse["Date"].iloc[-1]
 
-    logger.error("[PriceHistory] ALL sources failed for %s. Returning empty DataFrame.", symbol)
-    return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+    # Get the latest foreign flow date as reference (quick fetch, small size)
+    ff_latest = _get_latest_foreign_date(symbol)
+
+    if ff_latest and ff_latest > dnse_latest:
+        logger.warning(
+            "[PriceHistory] DNSE lag detected for %s: DNSE latest=%s, Foreign latest=%s. "
+            "Fetching VNDirect to fill gap...",
+            symbol, dnse_latest, ff_latest,
+        )
+        df_vnd = _fetch_price_vndirect(symbol, days, latest_only=True)
+        if not df_vnd.empty:
+            vnd_latest = df_vnd["Date"].iloc[-1]
+            if vnd_latest > dnse_latest:
+                # Merge: keep DNSE rows except dates VNDirect has newer data for
+                df_merged = pd.concat([df_dnse, df_vnd], ignore_index=True)
+                df_merged = df_merged.drop_duplicates(subset="Date", keep="last")
+                df_merged = df_merged.sort_values("Date").tail(days).reset_index(drop=True)
+                logger.info(
+                    "[PriceHistory] Merged DNSE+VNDirect for %s: %d rows, latest=%s, close=%.2f",
+                    symbol, len(df_merged), df_merged["Date"].iloc[-1], df_merged["Close"].iloc[-1],
+                )
+                return df_merged
+            else:
+                logger.warning("[VNDirect] latest=%s still not newer than DNSE=%s", vnd_latest, dnse_latest)
+    else:
+        logger.info("[PriceHistory] DNSE up-to-date for %s (latest=%s)", symbol, dnse_latest)
+
+    return df_dnse
 
 
 # ── Public: get_foreign_flow ──────────────────────────────────────────────────
